@@ -128,12 +128,12 @@ lasso_recipe <- recipe(Class ~ ., data = lending_training) %>%
   step_upsample(Class, over_ratio = 0.5) %>% 
   step_downsample(Class, under_ratio = 1) %>% 
   step_mutate_at(all_numeric(), fn = ~as.numeric(.)) %>% 
-  #* Think about grouping factor variables with many levels: How can I do it?
-  step_normalize(all_predictors(),
-                 -all_nominal(),
-                 -all_outcomes()) %>%
-  step_dummy(all_nominal(),
-             -all_outcomes())
+  ### In here, I group factor variables 
+  step_mutate(sub_grade = as.character(sub_grade), 
+              grade = as.factor(str_sub(sub_grade,1,1)))%>% 
+  step_rm(sub_grade) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_normalize(all_numeric_predictors())
 ```
 
 ```{r apply_recipe}
@@ -187,8 +187,7 @@ lasso_tune <- lasso_wf %>%
   tune_grid(
     resamples = lending_cv,
     grid = penalty_grid, 
-    control = ctrl_grid
-  )
+    control = ctrl_grid)
 
 ```
 
@@ -210,10 +209,10 @@ rf_recipe <- recipe(Class ~ ., data = lending_training) %>%
 rf_model <- rand_forest(
               mtry = tune(), 
               min_n = tune(), 
-              trees = 100)
+              trees = 100) %>% 
   ## Do we need to set the mode and set the engine?
-  # set_mode("classification") %>%
-  # set_engine("ranger")
+  set_mode("classification") %>%
+  set_engine("ranger")
 
 rf_workflow <- workflow() %>%
   add_recipe(rf_recipe) %>%
@@ -223,14 +222,10 @@ rf_workflow <- workflow() %>%
 8. Set up the model tuning for both the `mtry` and `min_n` parameters. Be sure to add the `control_stack_grid()` for the `control` argument so we can use these results later when we stack. Use only 3 levels in the grid. For the `mtry` parameter, you need to put `finalize(mtry(), lending_training %>% select(-Class))` in as an argument instead of just `mtry()`, where `lending_training` is the name of your training data. This is because the `mtry()` grid will otherwise have unknowns in it. This part can take a while to run.
 
 ```{r}
-boost_mtry <- grid_regular(finalize(mtry(), lending_training %>% select(-Class)),
+boost_mtry_and_min_n <- grid_regular(finalize(mtry(), lending_training %>% select(-Class)),
+                           min_n(),
                            levels = 3)
-boost_mtry
-```
-```{r}
-boost_min_n =  grid_regular(min_n(),
-                           levels = 3)
-boost_min_n
+boost_mtry_and_min_n
 ```
 
 ```{r}
@@ -243,7 +238,7 @@ rf_tune <-
   rf_workflow %>% 
   tune_grid(
   resamples = lending_cv ,
-  grid = boost_mtry,
+  grid = boost_mtry_and_min_n,
   control = ctrl_grid
 )
 ```
@@ -251,72 +246,175 @@ rf_tune <-
 9. Find the best tuning parameters. What are the accuracy and area under the ROC curve for the model with those tuning parameters?
 
 ```{r}
+### Accuracy
+rf_acc <- rf_tune %>% 
+  show_best("accuracy") %>% 
+  filter(mtry == (rf_tune %>%  select_best("accuracy"))$mtry, 
+       min_n == (rf_tune %>%  select_best("accuracy"))$min_n)
+rf_acc
 
+
+### The roc_auc: 
+rf_roc <- rf_tune %>% 
+  show_best("roc_auc") %>% 
+  filter(mtry == (rf_tune %>%  select_best("roc_auc"))$mtry, 
+       min_n == (rf_tune %>%  select_best("roc_auc"))$min_n)
+
+rf_roc
 ```
 
+In here, we can see that if we choose the best accuracy rate, the accuracy will be 92.84%. Meanwhile, if we plan to prioritize the roc_curve, the accuracy will be 73.5%. 
 
 10. Next, we will fit a boosted tree using xgboost. We will only tune the `learn_rate` parameter. I have specified the model, recipe, and workflow below already (uncomment the code - you can this by highlighting it and then in the code tab at the top, choose comment/uncomment lines). You need to set up a grid of ten values for the tuning parameter and tune the model. Be sure to add the `control_stack_grid()` for the `control` argument so we can use these results later when we stack.
 
 ```{r}
-# xgboost_spec <- 
-#   boost_tree(
-#     trees = 1000, 
-#     min_n = 5, 
-#     tree_depth = 2, 
-#     learn_rate = tune(), 
-#     loss_reduction = 10^-5, 
-#     sample_size = 1) %>% 
-#   set_mode("classification") %>% 
-#   set_engine("xgboost") 
-# 
-# xgboost_recipe <- recipe(formula = Class ~ ., data = lending_training) %>% 
-#   step_upsample(Class, over_ratio = .5) %>% 
-#   step_downsample(Class, under_ratio = 1) %>% 
-#   step_mutate_at(all_numeric(), 
-#                  fn = ~as.numeric(.)) %>% 
-#   step_novel(all_nominal_predictors()) %>% 
-#   step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
-#   step_zv(all_predictors()) 
-# 
-# xgboost_workflow <- 
-#   workflow() %>% 
-#   add_recipe(xgboost_recipe) %>% 
-#   add_model(xgboost_spec) 
+xgboost_spec <-
+  boost_tree(
+    trees = 1000,
+    min_n = 5,
+    tree_depth = 2,
+    learn_rate = tune(),
+    loss_reduction = 10^-5,
+    sample_size = 1) %>%
+  set_mode("classification") %>%
+  set_engine("xgboost")
+
+xgboost_recipe <- recipe(formula = Class ~ ., data = lending_training) %>%
+  step_upsample(Class, over_ratio = .5) %>%
+  step_downsample(Class, under_ratio = 1) %>%
+  step_mutate_at(all_numeric(),
+                 fn = ~as.numeric(.)) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_zv(all_predictors())
+
+xgboost_workflow <-
+  workflow() %>%
+  add_recipe(xgboost_recipe) %>%
+  add_model(xgboost_spec)
 
 set.seed(494)
 registerDoParallel() 
 
-# boost_tune <- 
+## The boosting: 
 
+boost_learn_rate<- grid_regular(learn_rate(),
+                           levels = 3)
+
+boost_tune <-   xgboost_workflow %>% 
+  tune_grid(
+  resamples = lending_cv ,
+  grid = boost_learn_rate,
+  control = ctrl_grid
+)
 ```
 
 11. Find the best tuning parameters. What are the accuracy and area under the ROC curve for the model with those tuning parameters?
 
 ```{r}
+# Best tuning parameter by smallest rmse
+best_param_xgboost <- boost_tune %>% 
+  select_best(metric = "accuracy")
 ```
 
+```{r}
+best_param_xgboost
+```
 
 12. Create a model stack with the candidate models from the previous parts of the exercise and use the `blend_predictions()` function to find the coefficients of the stacked model. Create a plot examining the performance metrics for the different penalty parameters to assure you have captured the best one. If not, adjust the penalty. (HINT: use the `autoplot()` function). Which models are contributing most?
 
 ```{r}
-#lending_stack <- 
+lending_stack <- 
+  stacks() %>% 
+  add_candidates(lasso_tune) %>% 
+  add_candidates(rf_tune) %>% 
+  add_candidates(boost_tune)
 ```
 
 ```{r}
-#lending_blend <-
+as_tibble(lending_stack)
 ```
 
+
+```{r}
+lending_blend <- lending_stack %>% 
+  blend_predictions()
+
+lending_blend
+```
+
+```{r}
+lending_blend$metrics
+# lending_blend$metrics %>% 
+#   filter(.metric == "rmse")
+```
+
+```{r}
+autoplot(lending_blend)
+```
+
+If not, adjust the penalty. (HINT: use the `autoplot()` function). Which models are contributing most?
+
+```{r}
+autoplot(lending_blend, type = "members")
+```
+
+```{r}
+autoplot(lending_blend, type = "weights")
+```
+
+## Which one should I pick??
+
+In here, we can clearly see that xg_boost is contributing the most as the stacking coefficient for xg_boost is 250, compared to 5 for logistic_regression and around 0 for random_forest.
 
 13. Fit the final stacked model using `fit_members()`. Apply the model to the training data. Compute the accuracy, construct a confusion matrix, and create a density plot with `.pred_good` on the x-axis (the probability of a response of "good"), filled by `Class`. Comment on what you see. 
 
 ```{r}
-#lending_final_stack <- 
+lending_final_stack <- lending_blend %>% 
+  fit_members()
 ```
 
+```{r}
+lending_final_good_bad <- lending_final_stack %>% 
+  predict(new_data = lending_training)
 
+```
+
+```{r}
+lending_final_prediction <- lending_final_stack %>% 
+  predict(new_data = lending_training, type = "prob") %>% 
+  bind_cols(lending_training) %>% 
+  bind_cols(lending_final_good_bad)
+
+lending_final_prediction
+```
+
+```{r}
+lending_final_prediction %>%
+  conf_mat(truth = Class, estimate = .pred_class)
+```
+
+From this confusion matrix: 
+
+True positive rate: predicting good turns out to be good. True negative rate: predicting bad turns out to be bad.  
+
+- The true positive rate will be: $$\frac{7009}{7009+ 383} = \frac{7009}{7392} = 0.948$$
+
+- The true negative rate will be: $$\frac{0}{0 + 0} = \frac{0}{0}$$
+
+- The accuracy will be: $$\frac{7009}{7009+ 383} = \frac{7009}{7392} = 0.948$$.
+
+A density plot with `.pred_good` on the x-axis (the probability of a response of "good"), filled by `Class`:
+
+```{r}
+lending_final_prediction %>%
+  ggplot(aes(x = .pred_good, fill = Class)) + geom_density(alpha = 0.5, color = NA)
+```
+
+From the graph, we can see that the majority of the `Class` is predicted as good. We can see that the accuracy will be fairly high as we can see a small areas for overlap. On the other hand, we can see that the `
 14. In the previous problem, you saw that although the accuracy was quite high, the true negative rate (aka sensitivity) was terrible. It's common to see this when one of the classes has low representation. What we want to do now is investigate what happens in each of our models. Below I've provided code to investigate the lasso model (where `lasso_tune` is the name of my tuning step). Do similar things for the random forest and xgboost models. If you'd like to have a better true negative rate, which models would you choose and how would you go about doing this in a less manual way (you don't need to write code to do it - just describe it in words). Be sure to remove the `eval=FALSE` when you are finished.
 
-```{r, eval=FALSE}
+```{r}
 lasso_tune %>% 
   collect_predictions() %>% 
   group_by(id, penalty) %>% 
@@ -327,6 +425,36 @@ lasso_tune %>%
   summarize(across(accuracy:true_pos_rate, mean))
 ```
 
+```{r}
+### Random forest
+rf_tune %>% 
+  collect_predictions() %>% 
+  group_by(id, mtry, min_n) %>% 
+  summarize(accuracy = sum((Class == .pred_class))/n(),
+            true_neg_rate = sum(Class == "bad" & .pred_class == "bad")/sum(Class == "bad"),
+            true_pos_rate = sum(Class == "good" & .pred_class == "good")/sum(Class == "good")) %>% 
+  group_by(mtry,min_n) %>% 
+  summarize(across(accuracy:true_pos_rate, mean))
+```
+
+```{r}
+boost_tune %>% 
+  collect_predictions() %>% 
+  group_by(id, learn_rate) %>% 
+  summarize(accuracy = sum((Class == .pred_class))/n(),
+            true_neg_rate = sum(Class == "bad" & .pred_class == "bad")/sum(Class == "bad"),
+            true_pos_rate = sum(Class == "good" & .pred_class == "good")/sum(Class == "good")) %>% 
+  group_by(learn_rate) %>% 
+  summarize(across(accuracy:true_pos_rate, mean))
+```
+
+In here, when we compare the three models, we can see that if we want to get the highest negative rate, I will still choose the xgboost model since it will have true_negative_rate of 1 and true_positive rate of 0. 
+
+# how would you go about doing this in a less manual way?
+
+Choosing the true_neg_rate is not good, therefore, it would not be great if we create
+
+How can I balance accuracy, true_neg_rate, true_pos_rate. 
 
 ## Shiny app
 
@@ -343,6 +471,7 @@ In the future, you are going to create an app that allows a user to explore how 
 For this week, I want you to answer the following questions:
 
 1. How can you save a model you built to use it later (like in the shiny app you'll create)?
+
 
 2. For shiny apps that get published (like yours will), it's very important to have ALL the libraries that are used within the app loaded. If we were going to use the stacked model, which libraries do you think we'd need to load in our app?  
 
